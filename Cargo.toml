@@ -12,7 +12,7 @@ keywords = ["memory", "cortex", "arm", "mpu", "mcu"]
 categories = ["embedded", "no-std"]
 
 [dependencies]
-cortex-m = "0.6.1"
+cortex-m = "0.7"
 arrayvec = { version = "0.4.11", default-features = false }
 
 [workspace]

@@ -1,8 +1,10 @@
 #![no_std]
 
+mod region_list;
+
+pub use crate::region_list::RegionList;
 use cortex_m::{asm, peripheral::MPU};
 
-pub use arrayvec::ArrayVec;
 /// Enable bit in MPU_CTRL
 const CTRL_ENABLE: u32 = 1 << 0;
 /// Enable for hard fault and non-maskable interrupt bit in MPU_CTRL
@@ -10,33 +12,16 @@ const _CTRL_HFNMIENA: u32 = 1 << 1;
 /// Default memory map for privileged mode bit in MPU_CTRL
 const CTRL_PRIVDEFENA: u32 = 1 << 2;
 
-fn update_mpu_unprivileged(mpu: &mut MPU, f: impl FnOnce(&mut MPU)) {
-    // Atomic MPU updates:
-    // Turn off interrupts, turn off MPU, reconfigure, turn it back on, reenable interrupts.
-    // Turning off interrupts is not needed when the old configuration only applied to
-    // unprivileged thread code: The entire operation is interruptible, as long as the
-    // processor is never made to run any other thread-mode code.
-
-    // https://developer.arm.com/docs/dui0553/latest/cortex-m4-peripherals/optional-memory-protection-unit/updating-an-mpu-region
-    asm::dsb();
-
-    // Disable MPU while we update the regions
-    unsafe {
-        mpu.ctrl.write(0);
-    }
-
-    f(mpu);
-
-    unsafe {
-        // Enable MPU, but not for privileged code
-        mpu.ctrl.write(CTRL_ENABLE | CTRL_PRIVDEFENA);
-    }
-
-    asm::dsb();
-    asm::isb();
+/// The code that the MPU affects
+pub enum MpuScope {
+    /// Unprivileged code is restricted by the MPU, privileged code has full access
+    /// (default memory map)
+    UnprivilegedOnly,
+    /// All code is restricted by the MPU
+    All,
 }
 
-fn update_mpu(mpu: &mut MPU, f: impl FnOnce(&mut MPU)) {
+fn update_mpu(mpu: &mut MPU, scope: MpuScope, f: impl FnOnce(&mut MPU)) {
     // Atomic MPU updates:
     // Turn off interrupts, turn off MPU, reconfigure, turn it back on, reenable interrupts.
     // https://developer.arm.com/docs/dui0553/latest/cortex-m4-peripherals/optional-memory-protection-unit/updating-an-mpu-region
@@ -50,8 +35,12 @@ fn update_mpu(mpu: &mut MPU, f: impl FnOnce(&mut MPU)) {
         f(mpu);
 
         unsafe {
-            // Enable MPU for privileged and unprivileged code
-            mpu.ctrl.write(CTRL_ENABLE);
+            // Enable MPU
+            let privileged_flags = match scope {
+                MpuScope::UnprivilegedOnly => CTRL_PRIVDEFENA,
+                MpuScope::All => 0,
+            };
+            mpu.ctrl.write(CTRL_ENABLE  | privileged_flags);
         }
     });
 
@@ -62,6 +51,7 @@ fn update_mpu(mpu: &mut MPU, f: impl FnOnce(&mut MPU)) {
 /// The Cortex-M0+ MPU.
 pub mod cortex_m0p {
     use super::*;
+    use crate::region_list::UpTo8RegionList;
 
     /// Wrapper around the Cortex-M0+ Memory Protection Unit (MPU).
     pub struct Mpu(MPU);
@@ -72,8 +62,6 @@ pub mod cortex_m0p {
 
         /// Number of supported memory regions.
         pub const REGION_COUNT: u8 = 8;
-
-        const REGION_COUNT_USIZE: usize = Self::REGION_COUNT as usize;
 
         /// Creates a new MPU wrapper, taking ownership of the `MPU` peripheral.
         ///
@@ -89,7 +77,16 @@ pub mod cortex_m0p {
             self.0
         }
 
-        /// Configures the MPU to restrict access to software running in unprivileged mode.
+        /// Configures the MPU to restrict access
+        ///
+        /// ## `All` scope
+        ///
+        /// Any violation of the MPU settings will cause a *HardFault* exception. The Cortex-M0+
+        /// does not have a dedicated memory management exception.
+        ///
+        /// Code will only be allowed to access memory inside one of the given `regions`.
+        ///
+        /// ## `UnprivilegedOnly` scope
         ///
         /// Any violation of the MPU settings will cause a *HardFault* exception. The Cortex-M0+
         /// does not have a dedicated memory management exception.
@@ -100,65 +97,25 @@ pub mod cortex_m0p {
         /// Code running in privileged mode will not be restricted by the MPU, except that regions
         /// that have `executable` set to `false` will be marked as ***N**ever e**X**excute* (`NX`),
         /// which is enforced even for privileged code.
-        pub fn configure_unprivileged(
-            &mut self,
-            regions: &ArrayVec<[Region; Self::REGION_COUNT_USIZE]>,
-        ) {
-            // Safety: This is safe because it does not affect the privileged code calling it.
-            // Unprivileged, untrusted (non-Rust) code is always unsafe to call, so this doesn't
-            // have to be unsafe as well. If called by unprivileged code, the register writes will
-            // fault, which is also safe.
-
-            update_mpu_unprivileged(&mut self.0, |mpu| {
-                for (i, region) in regions.iter().enumerate() {
-                    unsafe {
-                        {
-                            let addr = (region.base_addr as u32) & !0b11111;
-                            let valid = 1 << 4;
-                            let region = i as u32;
-                            mpu.rbar.write(addr | valid | region);
-                        }
-
-                        {
-                            let xn = if region.executable { 0 } else { 1 << 28 };
-                            let ap = (region.permissions as u32) << 24;
-                            let scb = region.attributes.to_bits() << 16;
-                            let srd = u32::from(region.subregions.bits()) << 8;
-                            let size = u32::from(region.size.bits()) << 1;
-                            let enable = 1;
-
-                            mpu.rasr.write(xn | ap | scb | srd | size | enable);
-                        }
-                    }
-                }
-
-                // Disable the remaining regions
-                for i in regions.len()..usize::from(Self::REGION_COUNT) {
-                    unsafe {
-                        let addr = 0;
-                        let valid = 1 << 4;
-                        let region = i as u32;
-                        mpu.rbar.write(addr | valid | region);
-
-                        mpu.rasr.write(0); // disable region
-                    }
-                }
-            });
+        pub fn configure<R>(&mut self, scope: MpuScope, regions: &R)
+        where
+            R: UpTo8RegionList<Region>,
+        {
+            self.configure_runtime_length(scope, regions.as_ref());
         }
 
-        /// Configures the MPU to restrict access to software running in both privileged and
-        /// unprivileged modes.
+        /// Configures the MPU to restrict access
         ///
-        /// Any violation of the MPU settings will cause a *HardFault* exception. The Cortex-M0+
-        /// does not have a dedicated memory management exception.
+        /// See `configure` for details.
         ///
-        /// Code will only be allowed to access memory inside one of the given `regions`.
-        pub fn configure(
-            &mut self,
-            regions: &ArrayVec<[Region<FullAccessPermissions>; Self::REGION_COUNT_USIZE]>,
-        ) {
-            update_mpu(&mut self.0, |mpu| {
-                for (i, region) in regions.iter().enumerate() {
+        /// # Panics
+        ///
+        /// This function panics if the length of regions is greater than `REGION_COUNT`.
+        pub fn configure_runtime_length(&mut self, scope: MpuScope, regions: &[Region]) {
+            assert!(regions.len() <= usize::from(REGION_COUNT));
+
+            update_mpu(&mut self.0, scope, |mpu| {
+                for (i, region) in regions.as_ref().iter().enumerate() {
                     unsafe {
                         {
                             let addr = (region.base_addr as u32) & !0b11111;
@@ -181,7 +138,7 @@ pub mod cortex_m0p {
                 }
 
                 // Disable the remaining regions
-                for i in regions.len()..usize::from(Self::REGION_COUNT) {
+                for i in regions.as_ref().len()..usize::from(Self::REGION_COUNT) {
                     unsafe {
                         let addr = 0;
                         let valid = 1 << 4;
@@ -197,7 +154,7 @@ pub mod cortex_m0p {
 
     /// Memory region properties.
     #[derive(Debug, Copy, Clone)]
-    pub struct Region<P = AccessPermission> {
+    pub struct Region {
         /// Starting address of the region (lowest address).
         ///
         /// This must be aligned to the region's `size`.
@@ -213,7 +170,7 @@ pub mod cortex_m0p {
         /// other MPU settings.
         pub executable: bool,
         /// Data access permissions for the region.
-        pub permissions: P,
+        pub permissions: FullAccessPermissions,
         /// Memory type and cache policy attributes.
         pub attributes: MemoryAttributes,
     }
@@ -278,6 +235,7 @@ pub mod cortex_m0p {
 /// The Cortex-M4 MPU.
 pub mod cortex_m4 {
     use super::*;
+    use crate::region_list::UpTo8RegionList;
 
     /// Wrapper around the Cortex-M4 Memory Protection Unit (MPU).
     pub struct Mpu(MPU);
@@ -308,10 +266,19 @@ pub mod cortex_m4 {
         /// Configures the MPU to restrict access to software running in unprivileged mode.
         ///
         /// Code running in privileged mode will not be restricted by the MPU.
-        pub fn configure_unprivileged(
-            &mut self,
-            regions: &ArrayVec<[Region; Self::REGION_COUNT_USIZE]>,
-        ) {
+        pub fn configure_unprivileged<R>(&mut self, regions: &R)
+        where
+            R: UpTo8RegionList<Region>,
+        {
+            self.configure_unprivileged_runtime_length(regions.as_ref());
+        }
+
+        /// Configures the MPU to restrict access to software running in unprivileged mode.
+        ///
+        /// Code running in privileged mode will not be restricted by the MPU.
+        pub fn configure_unprivileged_runtime_length(&mut self, regions: &[Region]) {
+            assert!(regions.len() <= usize::from(REGION_COUNT));
+
             // Safety: This is safe because it does not affect the privileged code calling it.
             // Unprivileged, untrusted (non-Rust) code is always unsafe to call, so this doesn't
             // have to be unsafe as well. If called by unprivileged code, the register writes will
@@ -363,11 +330,23 @@ pub mod cortex_m4 {
         /// The changes take effect immediately on the code that called this function. If the
         /// code being executed ends up not readable or not executable, a MemManage fault
         /// will occur.
-        pub fn configure(
-            &mut self,
-            regions: &ArrayVec<[Region<FullAccessPermissions>; Self::REGION_COUNT_USIZE]>,
-        ) {
-            update_mpu(&mut self.0, |mpu| {
+        pub fn configure<R>(&mut self, scope: MpuScope, regions: &R)
+            where
+                R: UpTo8RegionList<Region>,
+        {
+            self.configure_runtime_length(scope, regions.as_ref());
+        }
+
+        /// Configures the MPU to restrict access
+        ///
+        /// See `configure` for details.
+        ///
+        /// # Panics
+        ///
+        /// This function panics if the length of regions is greater than `REGION_COUNT`.
+        pub fn configure_runtime_length(&mut self, scope: MpuScope, regions: &[Region]) {
+            assert!(regions.len() <= usize::from(REGION_COUNT));
+            update_mpu(&mut self.0,scope, |mpu| {
                 for (i, region) in regions.iter().enumerate() {
                     unsafe {
                         {
@@ -501,19 +480,6 @@ pub mod cortex_m4 {
         },
         // FIXME: There's also mixed "outer"/"inner" policies, but I don't know what that even means.
     }
-}
-
-/// Data access permissions for a memory region from unprivileged code.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum AccessPermission {
-    /// Any data access (read or write) will generate a fault.
-    NoAccess = 0b01,
-
-    /// Any write access will generate a fault.
-    ReadOnly = 0b10,
-
-    /// Region unprotected, both reads and writes are allowed.
-    ReadWrite = 0b11,
 }
 
 /// Data access permissions for privileged and unprivileged modes
